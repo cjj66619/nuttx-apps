@@ -1,0 +1,23 @@
+config EXAMPLES_WIFICONN
+	tristate "wificonn: one-shot WiFi connect helper"
+	default n
+	depends on WIRELESS_WAPI
+	---help---
+		Connect to a WPA2 AP with a single command:
+		  wificonn <ssid> <password>
+
+if EXAMPLES_WIFICONN
+
+config EXAMPLES_WIFICONN_PROGNAME
+	string "Program name"
+	default "wificonn"
+
+config EXAMPLES_WIFICONN_PRIORITY
+	int "Task priority"
+	default 100
+
+config EXAMPLES_WIFICONN_STACKSIZE
+	int "Stack size"
+	default 4096
+
+endif

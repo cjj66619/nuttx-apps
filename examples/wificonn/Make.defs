@@ -1,0 +1,7 @@
+############################################################################
+# apps/examples/wificonn/Make.defs
+############################################################################
+
+ifneq ($(CONFIG_EXAMPLES_WIFICONN),)
+CONFIGURED_APPS += $(APPDIR)/examples/wificonn
+endif
