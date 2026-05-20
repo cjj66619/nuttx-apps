@@ -43,8 +43,9 @@ static volatile int   g_hb_count      = 0;
 static volatile int   g_hb_fail       = 0;
 static time_t         g_start_time    = 0;
 static char           g_node_ip[INET_ADDRSTRLEN] = "?.?.?.?";
-static volatile int   g_mem_free_kb   = 0;  /* updated by main() at shallow stack */
+static volatile int   g_mem_free_kb   = 0;  /* updated by main() before accept() */
 static volatile int   g_mem_total_kb  = 0;
+static volatile int   g_cpu_pct       = -1; /* updated by main() before accept() */
 
 /* Public API for other tasks */
 void httpnode_record_infer(float result, int latency_us)
@@ -112,14 +113,15 @@ static void get_ip(char *buf, size_t len)
 
 static void handle_request(int conn)
 {
-  /* CPU load from /proc/cpuload — safe: file I/O, no malloc, no socket */
-  int cpu_pct = read_cpu_pct();
+  /* CPU and memory are pre-sampled in main() BEFORE accept() (system idle).
+   * Do NOT call read_cpu_pct() or mallinfo() here — measuring inside the
+   * request handler captures peak load and gives a bogus 100% reading. */
+  int cpu_pct = g_cpu_pct;
   int cpu_bar = (cpu_pct >= 0 && cpu_pct <= 100) ? cpu_pct : 0;
   char cpu_str[10];
   if (cpu_pct < 0) strncpy(cpu_str, "N/A", sizeof(cpu_str));
   else snprintf(cpu_str, sizeof(cpu_str), "%d%%", cpu_pct);
 
-  /* Memory from cached globals (updated in main at shallow stack depth) */
   int mem_free  = g_mem_free_kb;
   int mem_total = g_mem_total_kb;
   int mem_bar   = mem_total > 0 ? (100 * (mem_total - mem_free) / mem_total) : 0;
@@ -282,24 +284,19 @@ int main(int argc, FAR char *argv[])
   printf("[http] ✓ serving at http://%s:%d/\n", g_node_ip, port);
   printf("[http] open in phone browser (same WiFi: 312)\n");
 
-  /* Seed memory stats before first request */
-  {
-    struct mallinfo mi = mallinfo();
-    g_mem_total_kb = mi.arena / 1024;
-    g_mem_free_kb  = (mi.arena - mi.uordblks) / 1024;
-  }
-
   for (;;)
     {
-      int conn = accept(srv, NULL, NULL);
-
-      /* Refresh memory stats at minimal stack depth (safe to call mallinfo here) */
+      /* Sample CPU and memory BEFORE blocking on accept() — system is idle
+       * here so /proc/cpuload reflects true background load, not our own
+       * request-handling overhead.  mallinfo() is safe at this stack depth. */
+      g_cpu_pct = read_cpu_pct();
       {
         struct mallinfo mi = mallinfo();
         g_mem_total_kb = mi.arena / 1024;
         g_mem_free_kb  = (mi.arena - mi.uordblks) / 1024;
       }
 
+      int conn = accept(srv, NULL, NULL);  /* blocks until browser connects */
       if (conn >= 0) handle_request(conn);
     }
 
