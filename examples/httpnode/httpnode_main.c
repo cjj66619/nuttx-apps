@@ -33,19 +33,21 @@
  ****************************************************************************/
 
 static volatile int   g_infer_count   = 0;
-static volatile float g_infer_last    = 0.0f;
+static volatile int   g_infer_x10000  = 0;  /* last result * 10000, no FPU in HTTP task */
 static volatile int   g_infer_us      = 0;
 static volatile int   g_peer_count    = 0;
-static volatile char  g_peer_ip[INET_ADDRSTRLEN] = "—";
+static volatile char  g_peer_ip[INET_ADDRSTRLEN] = "-";
 static volatile int   g_hb_count      = 0;
 static volatile int   g_hb_fail       = 0;
+static time_t         g_start_time    = 0;  /* set at httpnode start */
+static char           g_node_ip[INET_ADDRSTRLEN] = "?.?.?.?"; /* set once in main */
 
 /* Public API for other tasks */
 void httpnode_record_infer(float result, int latency_us)
 {
   g_infer_count++;
-  g_infer_last = result;
-  g_infer_us   = latency_us;
+  g_infer_x10000 = (int)(result * 10000.0f);  /* FPU only in caller's task context */
+  g_infer_us     = latency_us;
 }
 
 void httpnode_record_peer(const char *ip)
@@ -85,23 +87,56 @@ static void get_ip(char *buf, size_t len)
 
 static void handle_request(int conn)
 {
-  char req[256];
-  recv(conn, req, sizeof(req) - 1, 0);   /* read and discard */
+  /* Drain the incoming HTTP request — required to flush lwIP IOBs before
+   * calling send().  Without this, send() processes stale IOBs that are
+   * not PSRAM-aligned, triggering EXCCAUSE=3 (LoadStoreAlignmentCause).
+   * Static + aligned(16) avoids the same trap on the recv side.
+   * NOTE: never call get_ip() / socket() here — opening a socket fd
+   * inside handle_request crashes up_saveusercontext on S3. */
+  static char req[256] __attribute__((aligned(16)));
+  recv(conn, req, sizeof(req) - 1, 0);
 
-  char ip[INET_ADDRSTRLEN];
-  get_ip(ip, sizeof(ip));
+  /* Uptime from recorded start time, not boot time */
+  long uptime_s = (long)(time(NULL) - g_start_time);
+  if (uptime_s < 0) uptime_s = 0;
+  long up_h = uptime_s / 3600;
+  long up_m = (uptime_s % 3600) / 60;
+  long up_s = uptime_s % 60;
 
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  long uptime_s = ts.tv_sec;
+  /* Memory: mallinfo crashes on PSRAM S3 (alignment fault).
+   * Show static hardware spec; user can run 'free' in NSH for live data. */
 
-  float reliability = g_hb_count
-    ? 100.0f * (float)(g_hb_count - g_hb_fail) / (float)g_hb_count
-    : 100.0f;
+  /* Pre-format floats — avoid %f in big snprintf (dtoa mutex → up_saveusercontext crash) */
+  int rel_pct = g_hb_count
+    ? (int)(100 * (g_hb_count - g_hb_fail) / g_hb_count)
+    : 100;
+  const char *rel_cls = g_hb_count == 0    ? "g" :
+                        rel_pct >= 90      ? "g" :
+                        rel_pct >= 70      ? "y" : "rr";
+
+  char score_str[20];
+  {
+    int sv    = g_infer_x10000;
+    int s_int  = sv / 10000;
+    int s_frac = sv % 10000;
+    if (s_frac < 0) { s_frac = -s_frac; s_int = -s_int; }
+    snprintf(score_str, sizeof(score_str), "%d.%04d", s_int, s_frac);
+  }
+
+  /* Latency display */
+  char lat_str[20];
+  if (g_infer_us == 0)
+    snprintf(lat_str, sizeof(lat_str), "&lt;1 µs");
+  else if (g_infer_us < 1000)
+    snprintf(lat_str, sizeof(lat_str), "%d µs", g_infer_us);
+  else
+    snprintf(lat_str, sizeof(lat_str), "%d.%02d ms",
+             g_infer_us / 1000, (g_infer_us % 1000) / 10);
+
 
   /* ── Build HTML ──────────────────────────────────────── */
 
-  char body[2048];
+  static char body[4096] __attribute__((aligned(16)));  /* 16B align for PSRAM lwIP send */
   int n = snprintf(body, sizeof(body),
     "<!DOCTYPE html><html><head>"
     "<meta charset='utf-8'>"
@@ -109,54 +144,65 @@ static void handle_request(int conn)
     "<meta http-equiv='refresh' content='3'>"
     "<title>openvela S3 Node</title>"
     "<style>"
-    "body{font-family:monospace;background:#0d1117;color:#e6edf3;margin:20px}"
-    "h1{color:#58a6ff;font-size:1.2em}"
-    ".card{background:#161b22;border:1px solid #30363d;border-radius:8px;"
-           "padding:12px;margin:10px 0}"
-    ".label{color:#8b949e;font-size:.85em}"
-    ".val{color:#3fb950;font-size:1.1em;font-weight:bold}"
-    ".warn{color:#f78166}"
-    ".ok{color:#3fb950}"
+    "*{box-sizing:border-box;margin:0;padding:0}"
+    "body{font-family:sans-serif;background:#f0f2f5;color:#1f2937;padding:12px}"
+    "h2{background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;"
+       "border-radius:10px;padding:12px;margin-bottom:10px;font-size:1em}"
+    ".c{background:#fff;border-radius:10px;padding:12px;margin:6px 0;"
+       "box-shadow:0 1px 3px rgba(0,0,0,.1)}"
+    ".t{font-size:.72em;font-weight:600;color:#6b7280;text-transform:uppercase}"
+    ".v{font-size:1.5em;font-weight:700;margin:4px 0}"
+    ".r{display:flex;justify-content:space-between;font-size:.82em;color:#374151;margin-top:4px}"
+    ".g{color:#166534;background:#dcfce7;padding:2px 8px;border-radius:12px}"
+    ".y{color:#854d0e;background:#fef9c3;padding:2px 8px;border-radius:12px}"
+    ".rr{color:#991b1b;background:#fee2e2;padding:2px 8px;border-radius:12px}"
+    "footer{text-align:center;font-size:.72em;color:#9ca3af;margin-top:10px}"
     "</style></head><body>"
-    "<h1>&#x1F4E1; openvela ESP32-S3 Node</h1>"
-    "<div class='card'>"
-    "<div class='label'>IP Address</div>"
-    "<div class='val'>%s</div>"
-    "<div class='label'>Uptime</div>"
-    "<div class='val'>%ldm %lds</div>"
-    "</div>"
-    "<div class='card'>"
-    "<div class='label'>AI Inference</div>"
-    "<div class='val'>%d calls &nbsp; last=%.4f &nbsp; %d us</div>"
-    "</div>"
-    "<div class='card'>"
-    "<div class='label'>Peers Discovered</div>"
-    "<div class='val'>%d &nbsp; last: %s</div>"
-    "</div>"
-    "<div class='card'>"
-    "<div class='label'>Heartbeat</div>"
-    "<div class='val'>tx=%d fail=%d reliability=<span class='%s'>%.1f%%</span></div>"
-    "</div>"
-    "<p style='color:#8b949e;font-size:.75em'>auto-refresh 3s &bull; "
-    "<a href='/' style='color:#58a6ff'>reload</a></p>"
-    "</body></html>",
-    ip,
-    uptime_s / 60, uptime_s % 60,
-    g_infer_count, g_infer_last, g_infer_us,
-    g_peer_count, (char *)g_peer_ip,
-    g_hb_count, g_hb_fail,
-    reliability >= 90.0f ? "ok" : "warn",
-    reliability);
 
-  char hdr[256];
+    "<h2>&#x1F4E1; openvela ESP32-S3 | %s | %ldh%ldm%lds</h2>"
+
+    "<div class='c'><div class='t'>AI Inference</div>"
+    "<div class='v'>%d calls</div>"
+    "<div class='r'><span>Score</span><span><b>%s</b></span></div>"
+    "<div class='r'><span>Latency</span><span><b>%s</b></span></div></div>"
+
+    "<div class='c'><div class='t'>Heartbeat</div>"
+    "<div class='v'><span class='%s'>%d%%</span></div>"
+    "<div class='r'><span>TX</span><span>%d</span></div>"
+    "<div class='r'><span>Fail</span><span>%d</span></div></div>"
+
+    "<div class='c'><div class='t'>Peers</div>"
+    "<div class='v'>%d</div>"
+    "<div class='r'><span>Last seen</span><span>%s</span></div></div>"
+
+    "<div class='c'><div class='t'>Hardware</div>"
+    "<div class='r'><span>Chip</span><span>ESP32-S3 @240MHz</span></div>"
+    "<div class='r'><span>PSRAM</span><span>8MB</span></div>"
+    "<div class='r'><span>RTOS</span><span>openvela/NuttX</span></div></div>"
+
+    "<footer>auto-refresh 3s &bull; <a href='/'>reload</a></footer>"
+    "</body></html>",
+
+    g_node_ip, up_h, up_m, up_s,
+    g_infer_count, score_str, lat_str,
+    rel_cls,
+    rel_pct,
+    g_hb_count, g_hb_fail,
+    g_peer_count, (char *)g_peer_ip
+  );
+
+  /* Clamp n to actual buffer size */
+  if (n <= 0 || n >= (int)sizeof(body)) n = (int)sizeof(body) - 1;
+
+  char hdr[256] __attribute__((aligned(4)));
   snprintf(hdr, sizeof(hdr),
     "HTTP/1.1 200 OK\r\n"
     "Content-Type: text/html; charset=utf-8\r\n"
     "Content-Length: %d\r\n"
     "Connection: close\r\n\r\n", n);
 
-  send(conn, hdr,  strlen(hdr), MSG_NOSIGNAL);
-  send(conn, body, n,           MSG_NOSIGNAL);
+  send(conn, hdr, strlen(hdr), 0);
+  send(conn, body, n, 0);
   close(conn);
 }
 
@@ -168,6 +214,7 @@ int main(int argc, FAR char *argv[])
 {
   int port = (argc > 1) ? atoi(argv[1]) : 8080;
 
+  g_start_time = time(NULL);   /* record start for uptime calculation */
   printf("[http] openvela HTTP node dashboard  (port %d)\n", port);
   printf("[http] tip: run as  'httpnode &'  to background\n");
 
@@ -190,9 +237,8 @@ int main(int argc, FAR char *argv[])
       return EXIT_FAILURE;
     }
 
-  char ip[INET_ADDRSTRLEN];
-  get_ip(ip, sizeof(ip));
-  printf("[http] ✓ serving at http://%s:%d/\n", ip, port);
+  get_ip(g_node_ip, sizeof(g_node_ip));
+  printf("[http] ✓ serving at http://%s:%d/\n", g_node_ip, port);
   printf("[http] open in phone browser (same WiFi: 312)\n");
 
   for (;;)
