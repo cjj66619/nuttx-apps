@@ -1,0 +1,3 @@
+ifneq ($(CONFIG_EXAMPLES_HTTPNODE),)
+CONFIGURED_APPS += $(APPDIR)/examples/httpnode
+endif

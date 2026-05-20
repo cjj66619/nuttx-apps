@@ -1,0 +1,24 @@
+config EXAMPLES_HTTPNODE
+	tristate "HTTP Node Dashboard"
+	default n
+	depends on NET_TCP && SCHED_LPWORK
+	---help---
+		Minimal HTTP server providing a real-time node status dashboard.
+		Displays IP, uptime, AI inference stats, peer discovery, heartbeat.
+		No filesystem required — HTML is inlined.
+
+if EXAMPLES_HTTPNODE
+
+config EXAMPLES_HTTPNODE_PROGNAME
+	string "Program name"
+	default "httpnode"
+
+config EXAMPLES_HTTPNODE_PRIORITY
+	int "Task priority"
+	default 100
+
+config EXAMPLES_HTTPNODE_STACKSIZE
+	int "Stack size"
+	default 4096
+
+endif
