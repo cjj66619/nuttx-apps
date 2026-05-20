@@ -80,11 +80,12 @@ static int read_cpu_pct(void)
   close(fd);
   if (r <= 0) return -1;
   buf[r] = '\0';
-  /* NuttX format: "  5.2%\n"  where the value is idle%.
-   * cpu_used% = 100 - idle% */
-  int idle_int, idle_frac;
-  if (sscanf(buf, " %d.%d%%", &idle_int, &idle_frac) == 2)
-    return 100 - idle_int;
+  /* NuttX format: " 15.3%\n"
+   * tmp = 1000 - (1000 * idle_ticks / total) → value = cpu-busy%.
+   * 0.0% = system idle,  100.0% = fully loaded.  Use directly. */
+  int cpu_int, cpu_frac;
+  if (sscanf(buf, " %d.%d%%", &cpu_int, &cpu_frac) == 2)
+    return cpu_int;
   return -1;
 }
 
