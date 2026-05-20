@@ -7,4 +7,6 @@ MODULE    = $(CONFIG_EXAMPLES_HTTPNODE)
 
 MAINSRC = httpnode_main.c
 
+CFLAGS += -I$(APPDIR)/examples/lednode
+
 include $(APPDIR)/Application.mk

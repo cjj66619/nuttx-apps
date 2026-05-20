@@ -1,0 +1,10 @@
+include $(APPDIR)/Make.defs
+
+PROGNAME  = lednode
+PRIORITY  = SCHED_PRIORITY_DEFAULT
+STACKSIZE = $(CONFIG_DEFAULT_TASK_STACKSIZE)
+MODULE    = $(CONFIG_EXAMPLES_LEDNODE)
+
+MAINSRC   = lednode_main.c
+
+include $(APPDIR)/Application.mk

@@ -7,6 +7,7 @@ MODULE    = $(CONFIG_EXAMPLES_INFERD)
 
 MAINSRC = inferd_main.c
 
+CFLAGS += -I$(APPDIR)/examples/lednode
 CFLAGS += -lm
 
 include $(APPDIR)/Application.mk

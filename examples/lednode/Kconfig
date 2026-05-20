@@ -1,0 +1,16 @@
+config EXAMPLES_LEDNODE
+	tristate "WS2812 RGB LED feedback daemon (lednode)"
+	default n
+	depends on ESP_RMT && RMTCHAR
+	---help---
+		RGB LED animation daemon for openvela ESP32-S3 nodes.
+		Provides visual feedback for WiFi state, AI inference,
+		heartbeat, HTTP requests, and CPU load via the on-board
+		WS2812 LED (GPIO48 or GPIO38) driven through /dev/rmt0.
+
+		Run with: nsh> lednode &
+
+		Other apps (httpnode, inferd) call lednode_base() /
+		lednode_flash() macros from lednode.h to signal events.
+		In NuttX flat/builtin mode all tasks share the same address
+		space, so the shared globals work without IPC overhead.

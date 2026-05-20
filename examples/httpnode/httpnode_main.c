@@ -29,6 +29,7 @@
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <sys/ioctl.h>
+#include "lednode.h"
 
 /****************************************************************************
  * Shared stats (updated by other tasks via httpnode_record_*)
@@ -53,6 +54,7 @@ void httpnode_record_infer(float result, int latency_us)
   g_infer_count++;
   g_infer_x10000 = (int)(result * 10000.0f);  /* FPU only in caller's task context */
   g_infer_us     = latency_us;
+  lednode_flash(LEDNODE_INFER);
 }
 
 void httpnode_record_peer(const char *ip)
@@ -63,8 +65,13 @@ void httpnode_record_peer(const char *ip)
 
 void httpnode_record_hb(int total, int fail)
 {
+  int prev_fail = g_hb_fail;
   g_hb_count = total;
   g_hb_fail  = fail;
+  if (fail > prev_fail)
+    lednode_flash(LEDNODE_HB_FAIL);
+  else
+    lednode_flash(LEDNODE_HB_TX);
 }
 
 /****************************************************************************
@@ -126,6 +133,8 @@ static void handle_request(int conn)
   int mem_free  = g_mem_free_kb;
   int mem_total = g_mem_total_kb;
   int mem_bar   = mem_total > 0 ? (100 * (mem_total - mem_free) / mem_total) : 0;
+
+  lednode_flash(LEDNODE_HTTP_REQ);
 
   /* Drain the incoming HTTP request — required to flush lwIP IOBs before
    * calling send().  Without this, send() processes stale IOBs that are

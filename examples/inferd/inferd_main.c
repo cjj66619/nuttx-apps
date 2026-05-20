@@ -26,6 +26,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
+#include "lednode.h"
+
 /* httpnode stats hook — weak so inferd works without httpnode running */
 extern void httpnode_record_infer(float result, int latency_us)
   __attribute__((weak));
@@ -313,6 +315,7 @@ static int mode_stress(int interval_ms)
   const int N = 50000;
   printf("[inferd] stress mode  N=%d FPU ops/call  interval=%dms\n", N, interval_ms);
   printf("[inferd] watch CPU load rise at http://<ip>:8080/\n");
+  lednode_base(LEDNODE_STRESS);   /* orange solid while stress runs */
   int count = 0;
   for (;;)
     {
