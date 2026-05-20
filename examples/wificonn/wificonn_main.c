@@ -17,7 +17,7 @@
 #include <netutils/netlib.h>
 
 #define IFNAME    "wlan0"
-#define TIMEOUT_S 15
+#define TIMEOUT_S 5
 
 int main(int argc, FAR char *argv[])
 {

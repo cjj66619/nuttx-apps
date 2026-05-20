@@ -61,8 +61,8 @@
 
 #define RMT_DEV            "/dev/rmt0"
 #define TICK_MS            50          /* 20 Hz animation tick */
-#define WIFI_CHECK_TICKS   40          /* check WiFi every 2 s */
-#define LED_BRIGHTNESS     40          /* global scale 0-255 */
+#define WIFI_CHECK_TICKS   10          /* check WiFi every 500ms */
+#define LED_STARTUP_TICKS  20          /* 1s solid white hardware test */
 
 /* WS2812 timing at APB 80 MHz (12.5 ns per count) */
 #define APB_NS             12.5f
@@ -94,7 +94,7 @@ static const int8_t k_flash_ticks[] =
  * Public Data (shared globals — declared extern in lednode.h)
  ****************************************************************************/
 
-volatile int g_led_base  = LEDNODE_BOOT;
+volatile int g_led_base  = LEDNODE_WIFI_CONN;  /* default: show connecting */
 volatile int g_led_flash = -1;
 
 /****************************************************************************
@@ -102,7 +102,7 @@ volatile int g_led_flash = -1;
  ****************************************************************************/
 
 static int      s_fd         = -1;    /* /dev/rmt0 file descriptor */
-static uint32_t s_rmt[RMT_TOTAL_WORDS];  /* encoded RMT frame buffer */
+static uint32_t s_rmt[RMT_TOTAL_WORDS] __attribute__((aligned(16))); /* RMT frame */
 
 /* Animation counters */
 static uint32_t s_tick       = 0;    /* global 50ms tick counter */
@@ -155,24 +155,21 @@ static void ws2812_encode_byte(uint8_t byte, uint32_t *dst)
 /****************************************************************************
  * Name: led_write
  * Description: Encode (r,g,b) and send one WS2812 frame via /dev/rmt0.
- *              WS2812 wire order is GRB.
+ *              This board's LED uses RGB byte order (not the standard WS2812 GRB).
  ****************************************************************************/
 
 static void led_write(uint8_t r, uint8_t g, uint8_t b)
 {
   if (s_fd < 0) return;
 
-  /* Scale by global brightness */
-  r = (uint8_t)((uint32_t)r * LED_BRIGHTNESS / 255);
-  g = (uint8_t)((uint32_t)g * LED_BRIGHTNESS / 255);
-  b = (uint8_t)((uint32_t)b * LED_BRIGHTNESS / 255);
-
-  ws2812_encode_byte(g, s_rmt);        /* GRB order: green first */
-  ws2812_encode_byte(r, s_rmt + 8);
+  ws2812_encode_byte(r, s_rmt);        /* RGB order: red first */
+  ws2812_encode_byte(g, s_rmt + 8);
   ws2812_encode_byte(b, s_rmt + 16);
   s_rmt[RMT_DATA_WORDS] = 0;          /* reset/end-of-frame marker */
 
-  write(s_fd, s_rmt, sizeof(s_rmt));
+  ssize_t n = write(s_fd, s_rmt, sizeof(s_rmt));
+  if (n < 0)
+    fprintf(stderr, "[led] write /dev/rmt0 failed: %d\n", errno);
 }
 
 /****************************************************************************
@@ -191,65 +188,57 @@ static void render_state(int state, uint32_t t)
       /* ── Base states ─────────────────────────────────────────────────── */
 
       case LEDNODE_BOOT:
-        /* White breathing, 3 s period (60 ticks) */
+        /* White breathing 0→60→0, 3s period */
         {
-          uint8_t v = triwave(t, 60, 255);
+          uint8_t v = triwave(t, 60, 60);
           r = v; g = v; b = v;
         }
         break;
 
       case LEDNODE_WIFI_CONN:
-        /* Blue 1 Hz blink (20 ticks period, on for first 10) */
-        if ((t % 20) < 10)
-          b = 255;
+        /* Blue 1Hz blink */
+        b = ((t % 20) < 10) ? 80 : 0;
         break;
 
       case LEDNODE_IDLE:
-        /* Slow green breathing, 4 s period (80 ticks), faint cyan tint */
+        /* Slow green breathing min=15 max=70, 4s period */
         {
-          uint8_t v = 30 + triwave(t, 80, 225);
+          uint8_t v = 15 + triwave(t, 80, 55);
           g = v;
-          b = v / 6;
+          b = v / 5;
         }
         break;
 
       case LEDNODE_STRESS:
-        /* Orange solid — CPU is loaded */
-        r = 255; g = 80; b = 0;
+        /* Orange solid */
+        r = 120; g = 40; b = 0;
         break;
 
       /* ── Flash events ────────────────────────────────────────────────── */
 
       case LEDNODE_HTTP_REQ:
-        /* White 100ms flash */
-        r = 255; g = 255; b = 255;
+        r = 80; g = 80; b = 80; /* white */
         break;
 
       case LEDNODE_INFER:
-        /* Purple 200ms flash */
-        r = 180; g = 0; b = 255;
+        r = 60; g = 0; b = 80;  /* purple */
         break;
 
       case LEDNODE_PEER_FOUND:
-        /* Cyan double-flash: on(2)-off(2)-on(2)-off(4) = 10 ticks */
+        /* Cyan double-flash: on(2)-off(2)-on(2)-off(4) */
         {
           int p = (int)(t % 10);
           if (p < 2 || (p >= 4 && p < 6))
-            {
-              g = 0; b = 255; r = 0;  /* cyan = green+blue */
-              g = 255;
-            }
+            { g = 80; b = 80; }
         }
         break;
 
       case LEDNODE_HB_TX:
-        /* Blue 50ms flash */
-        b = 200;
+        b = 60;   /* blue */
         break;
 
       case LEDNODE_HB_FAIL:
-        /* Red 300ms flash */
-        r = 255;
+        r = 120;  /* red */
         break;
 
       default:
@@ -349,10 +338,20 @@ int main(int argc, FAR char *argv[])
       return 1;
     }
 
-  printf("[led] /dev/rmt0 opened OK — starting animation loop\n");
+  printf("[led] /dev/rmt0 opened OK — 1s hardware test (bright white)...\n");
 
-  /* Initial WiFi check */
-  check_wifi();
+  /* Hardware test: solid bright white for 1s so user can verify LED works */
+  {
+    int i;
+    for (i = 0; i < LED_STARTUP_TICKS; i++)
+      {
+        led_write(80, 80, 80);  /* bright white */
+        usleep(TICK_MS * 1000);
+      }
+    led_write(0, 0, 0);  /* off before normal animation */
+  }
+  printf("[led] hardware test done — starting animation\n");
+  /* g_led_base starts as WIFI_CONN: blue blink until IP is detected */
 
   /* ── Main animation loop ──────────────────────────────────────────── */
   for (;;)

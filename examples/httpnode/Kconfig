@@ -19,6 +19,6 @@ config EXAMPLES_HTTPNODE_PRIORITY
 
 config EXAMPLES_HTTPNODE_STACKSIZE
 	int "Stack size"
-	default 4096
+	default 8192
 
 endif
