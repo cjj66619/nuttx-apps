@@ -1,0 +1,40 @@
+config EXAMPLES_NODELINK
+	tristate "Node-Link: openvela node status reporter"
+	default n
+	depends on NET_TCP
+	---help---
+		Periodic TCP status reporter for openvela inter-node demo.
+		Connects to a server and sends JSON-formatted node status.
+
+if EXAMPLES_NODELINK
+
+config EXAMPLES_NODELINK_PROGNAME
+	string "Program name"
+	default "nodelink"
+
+config EXAMPLES_NODELINK_PRIORITY
+	int "Task priority"
+	default 100
+
+config EXAMPLES_NODELINK_STACKSIZE
+	int "Stack size"
+	default 4096
+
+config EXAMPLES_NODELINK_SERVER_IP
+	string "Server IP address"
+	default "192.168.101.20"
+
+config EXAMPLES_NODELINK_SERVER_PORT
+	int "Server TCP port"
+	default 4444
+
+config EXAMPLES_NODELINK_INTERVAL_MS
+	int "Send interval (ms)"
+	default 2000
+
+config EXAMPLES_NODELINK_UDP
+	bool "Use UDP instead of TCP"
+	default n
+	depends on NET_UDP
+
+endif

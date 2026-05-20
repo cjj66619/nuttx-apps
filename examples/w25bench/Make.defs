@@ -1,0 +1,10 @@
+############################################################################
+# apps/examples/w25bench/Make.defs
+#
+# Licensed under the Apache License, Version 2.0 (the "License").  See
+# apps/examples/hello/Make.defs for the full boilerplate.
+############################################################################
+
+ifneq ($(CONFIG_EXAMPLES_W25BENCH),)
+CONFIGURED_APPS += $(APPDIR)/examples/w25bench
+endif

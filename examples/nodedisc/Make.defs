@@ -1,0 +1,5 @@
+ifneq ($(CONFIG_EXAMPLES_NODEDISC),)
+CONFIGURED_APPS += $(APPDIR)/examples/nodedisc
+else ifneq ($(CONFIG_EXAMPLES_NODELINK_DAEMON),)
+CONFIGURED_APPS += $(APPDIR)/examples/nodedisc
+endif

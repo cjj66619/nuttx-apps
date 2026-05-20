@@ -1,0 +1,3 @@
+ifneq ($(CONFIG_EXAMPLES_INFERD),)
+CONFIGURED_APPS += $(APPDIR)/examples/inferd
+endif

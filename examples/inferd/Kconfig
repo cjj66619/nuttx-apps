@@ -1,0 +1,28 @@
+config EXAMPLES_INFERD
+	tristate "Distributed Inference Daemon"
+	default n
+	depends on NET_TCP
+
+config EXAMPLES_INFERD_TFLITE
+	bool "Use real TFLite Micro inference (requires TFLITEMICRO)"
+	default n
+	depends on EXAMPLES_INFERD && TFLITEMICRO
+	---help---
+		Distributed TFLite Micro inference daemon for openvela ESP32-S3 mesh.
+		Supports local benchmark, TCP worker (server), and offload bench modes.
+
+if EXAMPLES_INFERD
+
+config EXAMPLES_INFERD_PROGNAME
+	string "Program name"
+	default "inferd"
+
+config EXAMPLES_INFERD_PRIORITY
+	int "Task priority"
+	default 100
+
+config EXAMPLES_INFERD_STACKSIZE
+	int "Stack size"
+	default 8192
+
+endif

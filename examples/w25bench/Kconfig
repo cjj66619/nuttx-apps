@@ -1,0 +1,31 @@
+#
+# For a description of the syntax of this configuration file,
+# see the file kconfig-language.txt in the NuttX tools repository.
+#
+
+config EXAMPLES_W25BENCH
+	tristate "W25Q NOR Flash benchmark"
+	default n
+	depends on MTD_W25 && BCH
+	---help---
+		Enable the w25bench micro-benchmark.  It measures read / write
+		throughput against /dev/w25 through the standard VFS path
+		(FTL + BCH wrappers included).  Use as a baseline before the
+		W2 D6 SPI-DMA + W25 bulk-exchange rework and again after, to
+		quantify the speed-up that the deep optimisation produces.
+
+if EXAMPLES_W25BENCH
+
+config EXAMPLES_W25BENCH_PROGNAME
+	string "Program name"
+	default "w25bench"
+
+config EXAMPLES_W25BENCH_PRIORITY
+	int "Task priority"
+	default 100
+
+config EXAMPLES_W25BENCH_STACKSIZE
+	int "Stack size"
+	default 4096
+
+endif

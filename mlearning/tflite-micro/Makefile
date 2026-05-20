@@ -53,8 +53,11 @@ COMMON_FLAGS += -Wno-shadow
 COMMON_FLAGS += -Wno-sign-compare
 COMMON_FLAGS += -Wno-undef
 COMMON_FLAGS += -Wno-unused-variable
+COMMON_FLAGS += -fpermissive
 COMMON_FLAGS += -DTFLITE_EMULATE_FLOAT
 COMMON_FLAGS += -DTF_LITE_DISABLE_X86_NEON
+COMMON_FLAGS += -DTF_LITE_USE_GLOBAL_MAX
+COMMON_FLAGS += -DTF_LITE_USE_GLOBAL_MIN
 ifneq ($(CONFIG_TFLITEMICRO_DEBUG),)
 COMMON_FLAGS += -DTF_LITE_SHOW_MEMORY_USE
 COMMON_FLAGS += -DTF_LITE_USE_CTIME
@@ -77,6 +80,7 @@ CXXSRCS += $(wildcard $(TFLM_DIR)/tensorflow/lite/micro/memory_planner/*.cc)
 CXXSRCS += $(wildcard $(TFLM_DIR)/tensorflow/lite/micro/tflite_bridge/*.cc)
 CXXSRCS += $(wildcard $(TFLM_DIR)/tensorflow/lite/schema/*.cc)
 CXXSRCS := $(filter-out %test.cc, $(CXXSRCS))
+CXXSRCS := $(filter-out %softmax_common.cc, $(CXXSRCS))
 
 ifneq ($(CONFIG_ETHOSU),)
 CXXSRCS += $(wildcard $(TFLM_DIR)/tensorflow/lite/micro/kernels/ethos_u/*.cc)
@@ -89,6 +93,7 @@ COMMON_FLAGS += ${INCDIR_PREFIX}$(APPDIR)/mlearning/cmsis-nn/cmsis-nn
 
 CMSIS_NN_SRCS := $(wildcard $(TFLM_DIR)/tensorflow/lite/micro/kernels/cmsis_nn/*.cc)
 UNNEEDED_SRCS := $(addprefix $(TFLM_DIR)/tensorflow/lite/micro/kernels/, $(notdir $(CMSIS_NN_SRCS)))
+UNNEEDED_SRCS += $(TFLM_DIR)/tensorflow/lite/micro/kernels/softmax_common.cc
 CXXSRCS := $(filter-out $(UNNEEDED_SRCS), $(CXXSRCS))
 CXXSRCS += $(CMSIS_NN_SRCS)
 
@@ -108,6 +113,14 @@ MAINSRC   = tflm_tool.cc
 PROGNAME  = tflm
 PRIORITY  = $(CONFIG_TFLITEMICRO_TOOL_PRIORITY)
 STACKSIZE = $(CONFIG_TFLITEMICRO_TOOL_STACKSIZE)
+endif
+
+ifneq ($(CONFIG_TFLITEMICRO_HELLO),)
+MAINSRC   += tflm_hello.cc
+CXXSRCS   += hello_world_model_data.cc
+PROGNAME  += $(CONFIG_TFLITEMICRO_HELLO_PROGNAME)
+PRIORITY  += $(CONFIG_TFLITEMICRO_HELLO_PRIORITY)
+STACKSIZE += $(CONFIG_TFLITEMICRO_HELLO_STACKSIZE)
 endif
 
 CFLAGS   += ${COMMON_FLAGS}

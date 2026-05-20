@@ -73,4 +73,25 @@ if TFLITEMICRO_BENCHMARK_TOOL
 	default 32768
 endif
 
+config TFLITEMICRO_HELLO
+	bool "hello_world embedded inference demo (no filesystem)"
+	default n
+	---help---
+		Runs hello_world_int8 model embedded as a C array.
+		Reports per-inference latency. Suitable for bare S3.
+
+if TFLITEMICRO_HELLO
+	config TFLITEMICRO_HELLO_PROGNAME
+	string "Program name"
+	default "tflm_hello"
+
+	config TFLITEMICRO_HELLO_PRIORITY
+	int "Task priority"
+	default 100
+
+	config TFLITEMICRO_HELLO_STACKSIZE
+	int "Stack size"
+	default 16384
+endif
+
 endif

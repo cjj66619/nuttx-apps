@@ -1,0 +1,32 @@
+config EXAMPLES_DELTA
+	tristate "δ C2 scheduling benchmark for openvela S3"
+	default n
+	depends on PTHREAD_MUTEX_TYPES
+	---help---
+		Ports the C2 dependency-graph scheduler to NuttX RTOS and
+		benchmarks three scheduling strategies (B_seq / B_systemd / C2)
+		on a 4-task IMU processing pipeline. Reports measured speedup.
+
+if EXAMPLES_DELTA
+
+config EXAMPLES_DELTA_PROGNAME
+	string "Program name"
+	default "delta_bench"
+
+config EXAMPLES_DELTA_PRIORITY
+	int "Task priority"
+	default 100
+
+config EXAMPLES_DELTA_STACKSIZE
+	int "Stack size"
+	default 8192
+
+config EXAMPLES_DELTA_TFLITE
+	bool "Use real TFLite Micro inference in infer task"
+	default n
+	depends on TFLITEMICRO
+	---help---
+		Replace the simulated infer usleep with actual TFLite Micro
+		inference (hello_world_int8). Requires CONFIG_TFLITEMICRO_HELLO.
+
+endif

@@ -1,0 +1,48 @@
+config EXAMPLES_NODEDISC
+	tristate "openvela Node Discovery + Auto-connect"
+	default n
+	depends on NET_UDP && NET_TCP
+	---help---
+		UDP broadcast discovery (compatible with netutils/discover daemon)
+		followed by automatic TCP nodelink connection to the first found peer.
+		Measures discovery latency and connection speed for scoring.
+
+if EXAMPLES_NODEDISC
+
+config EXAMPLES_NODEDISC_PROGNAME
+	string "Program name"
+	default "nodedisc"
+
+config EXAMPLES_NODEDISC_PRIORITY
+	int "Task priority"
+	default 100
+
+config EXAMPLES_NODEDISC_STACKSIZE
+	int "Stack size"
+	default 4096
+
+endif
+
+config EXAMPLES_NODELINK_DAEMON
+	tristate "openvela Nodelink Daemon (heartbeat + auto-reconnect)"
+	default n
+	depends on NET_UDP && NET_TCP
+	---help---
+		Persistent connection daemon with heartbeat and automatic
+		discovery-based reconnection. Demonstrates 断连重连机制 (5 pts).
+
+if EXAMPLES_NODELINK_DAEMON
+
+config EXAMPLES_NODELINK_DAEMON_PROGNAME
+	string "Program name"
+	default "nodelink_daemon"
+
+config EXAMPLES_NODELINK_DAEMON_PRIORITY
+	int "Task priority"
+	default 100
+
+config EXAMPLES_NODELINK_DAEMON_STACKSIZE
+	int "Stack size"
+	default 4096
+
+endif
