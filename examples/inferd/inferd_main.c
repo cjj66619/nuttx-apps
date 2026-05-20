@@ -26,6 +26,10 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
+/* httpnode stats hook — weak so inferd works without httpnode running */
+extern void httpnode_record_infer(float result, int latency_us)
+  __attribute__((weak));
+
 /* TFLite Micro C interface — real or mock */
 #ifdef CONFIG_EXAMPLES_INFERD_TFLITE
 extern int tflm_infer_init(void);
@@ -47,6 +51,7 @@ static int tflm_infer_once(float input, float *output)
 #define INFERD_PORT       4446
 #define DEFAULT_N         100
 #define BENCH_RUNS        50
+#define BATCH_SIZE        1000   /* repeat each call N times for stable timing */
 
 /****************************************************************************
  * Helpers
@@ -87,19 +92,31 @@ static int mode_local(int n)
   for (int i = 0; i < n; i++)
     {
       float input = synth_input(i);
+
+      /* Batch BATCH_SIZE calls to get stable timing on fast mock */
       uint32_t t0 = now_us();
-      tflm_infer_once(input, &output);
-      uint32_t dt = now_us() - t0;
+      for (int b = 0; b < BATCH_SIZE; b++)
+        tflm_infer_once(input, &output);
+      uint32_t dt_batch = now_us() - t0;
+      uint32_t dt = dt_batch / BATCH_SIZE;   /* per-call latency */
       total_us += dt;
+
+      if (httpnode_record_infer)
+        httpnode_record_infer(output, (int)(dt ? dt : dt_batch));
 
       if (i < 5 || i == n - 1)
         printf("[inferd] %-6d  %-8.4f  %-8.4f  (%u us)\n",
-               i, input, output, dt);
+               i, input, output, dt ? dt : dt_batch);
     }
 
   printf("\n[inferd] === Local Inference Stats ===\n");
+#ifdef CONFIG_EXAMPLES_INFERD_TFLITE
+  printf("[inferd] engine      : TFLite Micro (real)\n");
+#else
+  printf("[inferd] engine      : mock sinf  (x%d batch avg)\n", BATCH_SIZE);
+#endif
   printf("[inferd] runs        : %d\n", n);
-  printf("[inferd] avg latency : %.1f us  (%.3f ms)\n",
+  printf("[inferd] avg latency : %.2f us  (%.4f ms)\n",
          (float)total_us / n, (float)total_us / n / 1000.0f);
   printf("[inferd] total time  : %.1f ms\n", (float)total_us / 1000.0f);
   return 0;
@@ -294,6 +311,7 @@ int main(int argc, FAR char *argv[])
     {
       printf("Usage:\n"
              "  inferd local  [N]         local inference benchmark\n"
+             "  inferd demo   [interval_ms] continuous demo (default 1000ms)\n"
              "  inferd server             TCP worker (port %d)\n"
              "  inferd bench  <ip> [N]    local vs offloaded comparison\n",
              INFERD_PORT);
@@ -304,6 +322,30 @@ int main(int argc, FAR char *argv[])
     {
       int n = (argc >= 3) ? atoi(argv[2]) : DEFAULT_N;
       return mode_local(n) == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+  else if (strcmp(argv[1], "demo") == 0)
+    {
+      int interval_ms = (argc >= 3) ? atoi(argv[2]) : 1000;
+      if (tflm_infer_init() < 0) return EXIT_FAILURE;
+      printf("[inferd] demo mode  interval=%dms  Ctrl+C to stop\n",
+             interval_ms);
+      printf("[inferd] watch dashboard at http://<ip>:8080/\n");
+      int count = 0;
+      for (;;)
+        {
+          float input = synth_input(count);
+          float output;
+          uint32_t t0 = now_us();
+          tflm_infer_once(input, &output);
+          int dt = (int)(now_us() - t0);
+          count++;
+          if (httpnode_record_infer)
+            httpnode_record_infer(output, dt);
+          printf("[inferd] demo #%-4d  in=%.4f  out=%.4f  %dus\n",
+                 count, input, output, dt);
+          usleep(interval_ms * 1000);
+        }
+      return EXIT_SUCCESS;
     }
   else if (strcmp(argv[1], "server") == 0)
     {

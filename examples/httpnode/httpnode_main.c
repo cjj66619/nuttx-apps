@@ -22,7 +22,6 @@
 #include <unistd.h>
 #include <time.h>
 #include <errno.h>
-#include <pthread.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -162,14 +161,18 @@ static void handle_request(int conn)
 }
 
 /****************************************************************************
- * Server thread
+ * main — run as background job: "httpnode &"
  ****************************************************************************/
 
-static void *server_thread(void *arg)
+int main(int argc, FAR char *argv[])
 {
-  int port = (int)(intptr_t)arg;
-  int srv  = socket(AF_INET, SOCK_STREAM, 0);
-  int on   = 1;
+  int port = (argc > 1) ? atoi(argv[1]) : 8080;
+
+  printf("[http] openvela HTTP node dashboard  (port %d)\n", port);
+  printf("[http] tip: run as  'httpnode &'  to background\n");
+
+  int srv = socket(AF_INET, SOCK_STREAM, 0);
+  int on  = 1;
   setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
 
   struct sockaddr_in addr;
@@ -181,14 +184,16 @@ static void *server_thread(void *arg)
   if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) < 0 ||
       listen(srv, 4) < 0)
     {
-      printf("[http] bind/listen failed: %s\n", strerror(errno));
+      printf("[http] bind/listen on port %d failed: %s\n",
+             port, strerror(errno));
       close(srv);
-      return NULL;
+      return EXIT_FAILURE;
     }
 
   char ip[INET_ADDRSTRLEN];
   get_ip(ip, sizeof(ip));
-  printf("[http] serving at http://%s:%d/  (auto-refresh 3s)\n", ip, port);
+  printf("[http] ✓ serving at http://%s:%d/\n", ip, port);
+  printf("[http] open in phone browser (same WiFi: 312)\n");
 
   for (;;)
     {
@@ -196,27 +201,6 @@ static void *server_thread(void *arg)
       if (conn >= 0) handle_request(conn);
     }
 
-  return NULL;
-}
-
-/****************************************************************************
- * main
- ****************************************************************************/
-
-int main(int argc, FAR char *argv[])
-{
-  int port = (argc > 1) ? atoi(argv[1]) : 80;
-
-  printf("[http] openvela HTTP node dashboard  (port %d)\n", port);
-
-  pthread_t tid;
-  pthread_attr_t attr;
-  pthread_attr_init(&attr);
-  pthread_attr_setstacksize(&attr, 4096);
-  pthread_create(&tid, &attr, server_thread, (void *)(intptr_t)port);
-  pthread_attr_destroy(&attr);
-  pthread_detach(tid);
-
-  printf("[http] background server started, returning to NSH\n");
+  close(srv);
   return EXIT_SUCCESS;
 }
