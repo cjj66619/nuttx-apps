@@ -22,6 +22,8 @@
 #include <unistd.h>
 #include <time.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <malloc.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -39,8 +41,10 @@ static volatile int   g_peer_count    = 0;
 static volatile char  g_peer_ip[INET_ADDRSTRLEN] = "-";
 static volatile int   g_hb_count      = 0;
 static volatile int   g_hb_fail       = 0;
-static time_t         g_start_time    = 0;  /* set at httpnode start */
-static char           g_node_ip[INET_ADDRSTRLEN] = "?.?.?.?"; /* set once in main */
+static time_t         g_start_time    = 0;
+static char           g_node_ip[INET_ADDRSTRLEN] = "?.?.?.?";
+static volatile int   g_mem_free_kb   = 0;  /* updated by main() at shallow stack */
+static volatile int   g_mem_total_kb  = 0;
 
 /* Public API for other tasks */
 void httpnode_record_infer(float result, int latency_us)
@@ -60,6 +64,27 @@ void httpnode_record_hb(int total, int fail)
 {
   g_hb_count = total;
   g_hb_fail  = fail;
+}
+
+/****************************************************************************
+ * Read CPU load from /proc/cpuload (file I/O — no malloc, no socket, safe)
+ ****************************************************************************/
+
+static int read_cpu_pct(void)
+{
+  static char buf[64] __attribute__((aligned(16)));
+  int fd = open("/proc/cpuload", O_RDONLY);
+  if (fd < 0) return -1;
+  int r = read(fd, buf, sizeof(buf) - 1);
+  close(fd);
+  if (r <= 0) return -1;
+  buf[r] = '\0';
+  /* NuttX format: "  5.2%\n"  where the value is idle%.
+   * cpu_used% = 100 - idle% */
+  int idle_int, idle_frac;
+  if (sscanf(buf, " %d.%d%%", &idle_int, &idle_frac) == 2)
+    return 100 - idle_int;
+  return -1;
 }
 
 /****************************************************************************
@@ -87,6 +112,18 @@ static void get_ip(char *buf, size_t len)
 
 static void handle_request(int conn)
 {
+  /* CPU load from /proc/cpuload — safe: file I/O, no malloc, no socket */
+  int cpu_pct = read_cpu_pct();
+  int cpu_bar = (cpu_pct >= 0 && cpu_pct <= 100) ? cpu_pct : 0;
+  char cpu_str[10];
+  if (cpu_pct < 0) strncpy(cpu_str, "N/A", sizeof(cpu_str));
+  else snprintf(cpu_str, sizeof(cpu_str), "%d%%", cpu_pct);
+
+  /* Memory from cached globals (updated in main at shallow stack depth) */
+  int mem_free  = g_mem_free_kb;
+  int mem_total = g_mem_total_kb;
+  int mem_bar   = mem_total > 0 ? (100 * (mem_total - mem_free) / mem_total) : 0;
+
   /* Drain the incoming HTTP request — required to flush lwIP IOBs before
    * calling send().  Without this, send() processes stale IOBs that are
    * not PSRAM-aligned, triggering EXCCAUSE=3 (LoadStoreAlignmentCause).
@@ -102,9 +139,6 @@ static void handle_request(int conn)
   long up_h = uptime_s / 3600;
   long up_m = (uptime_s % 3600) / 60;
   long up_s = uptime_s % 60;
-
-  /* Memory: mallinfo crashes on PSRAM S3 (alignment fault).
-   * Show static hardware spec; user can run 'free' in NSH for live data. */
 
   /* Pre-format floats — avoid %f in big snprintf (dtoa mutex → up_saveusercontext crash) */
   int rel_pct = g_hb_count
@@ -147,19 +181,24 @@ static void handle_request(int conn)
     "*{box-sizing:border-box;margin:0;padding:0}"
     "body{font-family:sans-serif;background:#f0f2f5;color:#1f2937;padding:12px}"
     "h2{background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;"
-       "border-radius:10px;padding:12px;margin-bottom:10px;font-size:1em}"
-    ".c{background:#fff;border-radius:10px;padding:12px;margin:6px 0;"
-       "box-shadow:0 1px 3px rgba(0,0,0,.1)}"
-    ".t{font-size:.72em;font-weight:600;color:#6b7280;text-transform:uppercase}"
-    ".v{font-size:1.5em;font-weight:700;margin:4px 0}"
-    ".r{display:flex;justify-content:space-between;font-size:.82em;color:#374151;margin-top:4px}"
-    ".g{color:#166534;background:#dcfce7;padding:2px 8px;border-radius:12px}"
-    ".y{color:#854d0e;background:#fef9c3;padding:2px 8px;border-radius:12px}"
-    ".rr{color:#991b1b;background:#fee2e2;padding:2px 8px;border-radius:12px}"
-    "footer{text-align:center;font-size:.72em;color:#9ca3af;margin-top:10px}"
+       "border-radius:12px;padding:14px;margin-bottom:10px;font-size:1em}"
+    "h2 small{font-size:.78em;opacity:.85;font-weight:400}"
+    ".c{background:#fff;border-radius:12px;padding:12px;margin:8px 0;"
+       "box-shadow:0 1px 4px rgba(0,0,0,.08)}"
+    ".t{font-size:.7em;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.06em}"
+    ".v{font-size:1.55em;font-weight:700;margin:4px 0;color:#111827}"
+    ".r{display:flex;justify-content:space-between;align-items:center;"
+       "font-size:.82em;color:#374151;margin-top:5px}"
+    ".g{color:#166534;background:#dcfce7;padding:2px 10px;border-radius:12px;font-weight:700}"
+    ".y{color:#854d0e;background:#fef9c3;padding:2px 10px;border-radius:12px;font-weight:700}"
+    ".rr{color:#991b1b;background:#fee2e2;padding:2px 10px;border-radius:12px;font-weight:700}"
+    ".b{height:6px;border-radius:3px;background:#e5e7eb;margin:5px 0 2px}"
+    ".f{height:6px;border-radius:3px}"
+    "footer{text-align:center;font-size:.72em;color:#9ca3af;margin-top:12px}"
+    "a{color:#6366f1}"
     "</style></head><body>"
 
-    "<h2>&#x1F4E1; openvela ESP32-S3 | %s | %ldh%ldm%lds</h2>"
+    "<h2>&#x1F4E1; openvela ESP32-S3<br><small>%s &nbsp;|&nbsp; up %ldh%ldm%lds</small></h2>"
 
     "<div class='c'><div class='t'>AI Inference</div>"
     "<div class='v'>%d calls</div>"
@@ -175,20 +214,22 @@ static void handle_request(int conn)
     "<div class='v'>%d</div>"
     "<div class='r'><span>Last seen</span><span>%s</span></div></div>"
 
-    "<div class='c'><div class='t'>Hardware</div>"
-    "<div class='r'><span>Chip</span><span>ESP32-S3 @240MHz</span></div>"
-    "<div class='r'><span>PSRAM</span><span>8MB</span></div>"
-    "<div class='r'><span>RTOS</span><span>openvela/NuttX</span></div></div>"
+    "<div class='c'><div class='t'>&#x1F4BB; System</div>"
+    "<div class='r'><span>CPU</span><span><b>%s</b></span></div>"
+    "<div class='b'><div class='f' style='width:%d%%;background:#6366f1'></div></div>"
+    "<div class='r'><span>RAM free</span><span><b>%d / %d KB</b></span></div>"
+    "<div class='b'><div class='f' style='width:%d%%;background:#f59e0b'></div></div></div>"
 
     "<footer>auto-refresh 3s &bull; <a href='/'>reload</a></footer>"
     "</body></html>",
 
     g_node_ip, up_h, up_m, up_s,
     g_infer_count, score_str, lat_str,
-    rel_cls,
-    rel_pct,
+    rel_cls, rel_pct,
     g_hb_count, g_hb_fail,
-    g_peer_count, (char *)g_peer_ip
+    g_peer_count, (char *)g_peer_ip,
+    cpu_str, cpu_bar,
+    mem_free, mem_total, mem_bar
   );
 
   /* Clamp n to actual buffer size */
@@ -241,9 +282,24 @@ int main(int argc, FAR char *argv[])
   printf("[http] ✓ serving at http://%s:%d/\n", g_node_ip, port);
   printf("[http] open in phone browser (same WiFi: 312)\n");
 
+  /* Seed memory stats before first request */
+  {
+    struct mallinfo mi = mallinfo();
+    g_mem_total_kb = mi.arena / 1024;
+    g_mem_free_kb  = (mi.arena - mi.uordblks) / 1024;
+  }
+
   for (;;)
     {
       int conn = accept(srv, NULL, NULL);
+
+      /* Refresh memory stats at minimal stack depth (safe to call mallinfo here) */
+      {
+        struct mallinfo mi = mallinfo();
+        g_mem_total_kb = mi.arena / 1024;
+        g_mem_free_kb  = (mi.arena - mi.uordblks) / 1024;
+      }
+
       if (conn >= 0) handle_request(conn);
     }
 

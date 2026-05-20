@@ -302,6 +302,38 @@ static int mode_bench(const char *peer_ip, int n)
 }
 
 /****************************************************************************
+ * Mode: stress — heavy FPU load, makes CPU visibly busy in dashboard
+ *
+ * Each call computes 50 000 iterations of sinf/cosf/sqrtf — enough to
+ * run for several ms on LX7@240MHz.  Latency shows as ms in dashboard.
+ ****************************************************************************/
+
+static int mode_stress(int interval_ms)
+{
+  const int N = 50000;
+  printf("[inferd] stress mode  N=%d FPU ops/call  interval=%dms\n", N, interval_ms);
+  printf("[inferd] watch CPU load rise at http://<ip>:8080/\n");
+  int count = 0;
+  for (;;)
+    {
+      float acc = 0.0f;
+      uint32_t t0 = now_us();
+      for (int i = 1; i <= N; i++)
+        acc += sinf((float)i * 0.001f) * cosf((float)i * 0.0007f)
+             + sqrtf((float)i * 0.0001f);
+      int dt = (int)(now_us() - t0);
+      count++;
+      float result = acc / N;   /* normalised to ~0-1 */
+      if (httpnode_record_infer)
+        httpnode_record_infer(result, dt);
+      printf("[inferd] stress #%-4d  acc=%+.4f  %d us (%d ms)\n",
+             count, result, dt, dt / 1000);
+      usleep(interval_ms * 1000);
+    }
+  return 0;
+}
+
+/****************************************************************************
  * main
  ****************************************************************************/
 
@@ -310,10 +342,11 @@ int main(int argc, FAR char *argv[])
   if (argc < 2)
     {
       printf("Usage:\n"
-             "  inferd local  [N]         local inference benchmark\n"
+             "  inferd local  [N]           local inference benchmark\n"
              "  inferd demo   [interval_ms] continuous demo (default 1000ms)\n"
-             "  inferd server             TCP worker (port %d)\n"
-             "  inferd bench  <ip> [N]    local vs offloaded comparison\n",
+             "  inferd stress [interval_ms] heavy FPU load (shows CPU in dashboard)\n"
+             "  inferd server               TCP worker (port %d)\n"
+             "  inferd bench  <ip> [N]      local vs offloaded comparison\n",
              INFERD_PORT);
       return EXIT_FAILURE;
     }
@@ -346,6 +379,11 @@ int main(int argc, FAR char *argv[])
           usleep(interval_ms * 1000);
         }
       return EXIT_SUCCESS;
+    }
+  else if (strcmp(argv[1], "stress") == 0)
+    {
+      int interval_ms = (argc >= 3) ? atoi(argv[2]) : 1000;
+      return mode_stress(interval_ms);
     }
   else if (strcmp(argv[1], "server") == 0)
     {
