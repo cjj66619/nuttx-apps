@@ -21,9 +21,17 @@
 #include <unistd.h>
 #include <time.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+
+/* δ-C2 hooks — resolved at link time if inferd is in the image */
+extern void dc2_update_peer(const char *ip, float cpu_pct)
+  __attribute__((weak));
+extern void httpnode_record_peer(const char *ip)
+  __attribute__((weak));
 
 /****************************************************************************
  * Definitions
@@ -46,6 +54,86 @@
 /****************************************************************************
  * Helpers
  ****************************************************************************/
+
+static float nld_read_cpu_pct(void)
+{
+  float pct = 0.0f;
+#ifdef CONFIG_FS_PROCFS
+  int fd = open("/proc/cpuload", O_RDONLY);
+  if (fd >= 0)
+    {
+      char buf[32];
+      int n = read(fd, buf, sizeof(buf) - 1);
+      close(fd);
+      if (n > 0) { buf[n] = '\0'; pct = strtof(buf, NULL); }
+    }
+#endif
+  return pct;
+}
+
+/****************************************************************************
+ * Server thread — listens on NODELINK_PORT, parses peer heartbeats
+ ****************************************************************************/
+
+static void *nld_server_thread(void *arg)
+{
+  (void)arg;
+  int srv = socket(AF_INET, SOCK_STREAM, 0);
+  if (srv < 0) return NULL;
+
+  int on = 1;
+  setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family      = AF_INET;
+  addr.sin_port        = htons(NODELINK_PORT);
+  addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+  if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) < 0 ||
+      listen(srv, 4) < 0)
+    {
+      close(srv);
+      return NULL;
+    }
+
+  printf("[nld] server listening on TCP :%d\n", NODELINK_PORT);
+
+  for (;;)
+    {
+      struct sockaddr_in cli;
+      socklen_t clen = sizeof(cli);
+      int conn = accept(srv, (struct sockaddr *)&cli, &clen);
+      if (conn < 0) continue;
+
+      char peer_ip[16];
+      inet_ntop(AF_INET, &cli.sin_addr, peer_ip, sizeof(peer_ip));
+      printf("[nld] peer connected: %s\n", peer_ip);
+
+      /* Register peer in δ-C2 table (CPU unknown until first heartbeat) */
+      if (dc2_update_peer)  dc2_update_peer(peer_ip, -1.0f);
+      if (httpnode_record_peer) httpnode_record_peer(peer_ip);
+
+      char buf[256];
+      for (;;)
+        {
+          int n = recv(conn, buf, sizeof(buf) - 1, 0);
+          if (n <= 0) break;
+          buf[n] = '\0';
+
+          /* Parse "cpu":XX.X from heartbeat JSON */
+          char *p = strstr(buf, "\"cpu\":");
+          if (p && dc2_update_peer)
+            dc2_update_peer(peer_ip, strtof(p + 6, NULL));
+        }
+
+      close(conn);
+      printf("[nld] peer disconnected: %s\n", peer_ip);
+    }
+
+  close(srv);
+  return NULL;
+}
 
 static long elapsed_ms(struct timespec *t0)
 {
@@ -132,16 +220,22 @@ int main(int argc, FAR char *argv[])
   int total_fail  = 0;
   int attempt     = 0;
 
+  /* Start server thread so peers can connect to us */
+  pthread_t srv_tid;
+  if (pthread_create(&srv_tid, NULL, nld_server_thread, NULL) == 0)
+    pthread_detach(srv_tid);
+
   printf("\n[nld] openvela Nodelink Daemon  (heartbeat=%ds, reconnect=%ds)\n"
          "[nld] max reconnect attempts: %d\n\n",
          HEARTBEAT_INTERVAL, RECONNECT_DELAY, max_retries);
+
+  int scan_silent = 0;   /* suppress repetitive "no peers" after first print */
 
   for (attempt = 0; max_retries == 0 || attempt <= max_retries; attempt++)
     {
       /* ── Phase 1: Discovery ─────────────────────────── */
 
       char peer_ip[INET_ADDRSTRLEN] = {0};
-      printf("[nld] [%d] discovering peers...\n", attempt);
 
       struct timespec t0;
       clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -149,12 +243,21 @@ int main(int argc, FAR char *argv[])
 
       if (disc_ms < 0)
         {
-          printf("[nld] no peers found, retry in %ds\n", RECONNECT_DELAY);
+          if (!scan_silent)
+            {
+              printf("[nld] no peers found — scanning silently (LED=idle)\n");
+              scan_silent = 1;
+            }
           sleep(RECONNECT_DELAY);
           continue;
         }
 
+      scan_silent = 0;   /* reset: print next "no peers" if peer disappears */
+
       printf("[nld] found: %s  (%dms)\n", peer_ip, disc_ms);
+
+      /* Register peer in δ-C2 table immediately on discovery */
+      if (dc2_update_peer) dc2_update_peer(peer_ip, -1.0f);
 
       /* ── Phase 2: TCP Connect ────────────────────────── */
 
@@ -190,11 +293,23 @@ int main(int argc, FAR char *argv[])
           beat++;
           total_tx++;
 
-          char hb[160];
+          float my_cpu = nld_read_cpu_pct();
+
+          /* Monotonic timestamp in microseconds — used for sync-precision
+           * measurement: receiver compares (remote_ts_us + RTT/2) vs its
+           * own clock_gettime to compute sync gap (target ≤ 10 ms). */
+          struct timespec ts_now;
+          clock_gettime(CLOCK_MONOTONIC, &ts_now);
+          long long ts_us = (long long)ts_now.tv_sec * 1000000LL
+                            + ts_now.tv_nsec / 1000;
+
+          char hb[256];
           snprintf(hb, sizeof(hb),
                    "{\"type\":\"hb\",\"node\":\"s3\","
-                   "\"beat\":%d,\"tx\":%d,\"ts\":%ld}\n",
-                   beat, total_tx, (long)time(NULL));
+                   "\"beat\":%d,\"tx\":%d,\"ts\":%ld,"
+                   "\"ts_us\":%lld,\"cpu\":%.1f}\n",
+                   beat, total_tx, (long)time(NULL),
+                   ts_us, (double)my_cpu);
 
           int n = send(conn, hb, strlen(hb), MSG_NOSIGNAL);
           if (n <= 0)
@@ -206,8 +321,11 @@ int main(int argc, FAR char *argv[])
               break;
             }
 
-          printf("[nld] heartbeat #%d OK   tx=%-4d fail=%d  peer=%s\n",
-                 beat, total_tx, total_fail, peer_ip);
+          /* Heartbeat OK: LED handles ongoing status, only log every 12th
+           * beat (~1 min) so console stays quiet during normal operation. */
+          if (beat == 1 || beat % 12 == 0)
+            printf("[nld] heartbeat OK  beat=%-4d  cpu=%.1f%%  peer=%s\n",
+                   beat, (double)my_cpu, peer_ip);
         }
 
       close(conn);

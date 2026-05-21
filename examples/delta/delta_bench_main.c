@@ -13,7 +13,10 @@
  * the c_scheduler, then EXECUTES each schedule with real pthreads +
  * message queues, measures actual wall time, and reports speedup.
  *
- * Usage:  delta_bench [--dry]    (--dry = skip task execution, algo only)
+ * Usage:  delta_bench [--dry] [--runs N] [--deadline D]
+ *   --dry        skip real execution, algo + stats only
+ *   --runs N     number of statistical runs (default 1; each adds ±20%% jitter)
+ *   --deadline D deadline in ms for meet-rate table (default 110)
  ****************************************************************************/
 
 #include <nuttx/config.h>
@@ -48,8 +51,8 @@ extern int tflm_infer_once(float input, float *output);
  * B_seq serializes all 6 tasks; C2 parallelizes preprocess_L/R.
  */
 #define DUR_RECV        5.0f   /* UDP recv both IMU frames ~5 ms */
-#define DUR_PREPROC_L  20.0f   /* left leg: timestamp align + quat ~20 ms */
-#define DUR_PREPROC_R  20.0f   /* right leg: timestamp align + quat ~20 ms */
+#define DUR_PREPROC_L  40.0f   /* left leg: timestamp align + Kalman + quat ~40 ms */
+#define DUR_PREPROC_R  40.0f   /* right leg: timestamp align + Kalman + quat ~40 ms */
 #define DUR_FUSE       10.0f   /* sensor fusion: relative angle ~10 ms */
 #define DUR_INFER      35.0f   /* TFLite Micro stub / real ~30-50 ms */
 #define DUR_TX          5.0f   /* UDP sendto result ~5 ms */
@@ -274,15 +277,37 @@ static void build_graph(cs_graph_t *g)
  * Main
  ****************************************************************************/
 
+/* Simple LCG pseudo-random for jitter (no stdlib rand dependency issues) */
+static uint32_t g_rng_state = 12345;
+static float rng_jitter(void)
+{
+  g_rng_state = g_rng_state * 1664525u + 1013904223u;
+  /* returns value in [-0.2, +0.2] */
+  return ((float)(g_rng_state & 0xffff) / 65535.0f) * 0.4f - 0.2f;
+}
+
 int main(int argc, FAR char *argv[])
 {
-  bool dry = false;
+  bool  dry      = false;
+  int   n_runs   = 1;
+  float deadline = 110.0f;
 
   for (int i = 1; i < argc; i++)
     {
       if (strcmp(argv[i], "--dry") == 0)
         {
           dry = true;
+        }
+      else if (strcmp(argv[i], "--runs") == 0 && i + 1 < argc)
+        {
+          n_runs = atoi(argv[++i]);
+          if (n_runs < 1) n_runs = 1;
+          if (n_runs > 200) n_runs = 200;
+          dry = true;  /* multi-run uses algo only for speed */
+        }
+      else if (strcmp(argv[i], "--deadline") == 0 && i + 1 < argc)
+        {
+          deadline = (float)atof(argv[++i]);
         }
     }
 
@@ -294,12 +319,16 @@ int main(int argc, FAR char *argv[])
          " → fuse(%.0f) → infer(%.0f) → tx(%.0f) ms\n",
          DUR_RECV, DUR_PREPROC_L, DUR_PREPROC_R,
          DUR_FUSE, DUR_INFER, DUR_TX);
-  printf("  IPC delta: %.1f ms   Mode: %s\n\n",
-         IPC_DELTA, dry ? "DRY (algo only)" : "EXECUTE (real pthreads)");
+  printf("  IPC delta: %.1f ms   Mode: %s   runs=%d   deadline=%.0f ms\n\n",
+         IPC_DELTA, dry ? "DRY (algo only)" : "EXECUTE (real pthreads)",
+         n_runs, deadline);
 
-  cs_graph_t    graph;
-  cs_schedule_t sched_seq;
-  cs_schedule_t sched_c2;
+  /* Static: cs_graph_t ~3660 B, cs_schedule_t ~216 B each.
+   * Placing on stack would overflow the default NuttX task stack (4 KB). */
+  static cs_graph_t    graph;
+  static cs_schedule_t sched_seq;
+  static cs_schedule_t sched_sys;
+  static cs_schedule_t sched_c2;
 
   build_graph(&graph);
 
@@ -321,6 +350,12 @@ int main(int argc, FAR char *argv[])
       return EXIT_FAILURE;
     }
 
+  if (cs_schedule_b_systemd(&graph, &sched_sys) != 0)
+    {
+      printf("[delta] ERROR: B_systemd scheduling failed\n");
+      return EXIT_FAILURE;
+    }
+
   if (cs_schedule_c2(&graph, &sched_c2) != 0)
     {
       printf("[delta] ERROR: C2 scheduling failed\n");
@@ -328,14 +363,104 @@ int main(int argc, FAR char *argv[])
     }
 
   cs_print_schedule(&sched_seq, &graph);
+  cs_print_schedule(&sched_sys, &graph);
   cs_print_schedule(&sched_c2,  &graph);
 
-  printf("\n--- Theoretical speedup: %.3f×\n",
+  printf("\n--- Theoretical speedup (B_seq vs C2): %.3f×\n",
          cs_speedup(&sched_seq, &sched_c2));
+  printf("--- Theoretical speedup (B_sys vs C2): %.3f×\n",
+         cs_speedup(&sched_sys, &sched_c2));
 
-  /* Execute schedules and measure wall time */
+  /* ------------------------------------------------------------------ */
+  /* Multi-run statistical deadline-meet-rate simulation                 */
+  /* Each run applies ±20%% uniform jitter per-task to model real-world  */
+  /* variability in WiFi recv, preprocessing, and inference timing.      */
+  /* ------------------------------------------------------------------ */
+  if (n_runs > 1)
+    {
+      int hit_seq = 0;
+      int hit_sys = 0;
+      int hit_c2  = 0;
+      float sum_seq = 0.0f;
+      float sum_sys = 0.0f;
+      float sum_c2  = 0.0f;
+
+      printf("\n--- Statistical simulation (%d runs, deadline=%.0f ms) ---\n",
+             n_runs, deadline);
+
+      for (int r = 0; r < n_runs; r++)
+        {
+          /* Apply ±20%% jitter to each task duration */
+          g_task_dur[0] = DUR_RECV      * (1.0f + rng_jitter());
+          g_task_dur[1] = DUR_PREPROC_L * (1.0f + rng_jitter());
+          g_task_dur[2] = DUR_PREPROC_R * (1.0f + rng_jitter());
+          g_task_dur[3] = DUR_FUSE      * (1.0f + rng_jitter());
+          g_task_dur[4] = DUR_INFER     * (1.0f + rng_jitter());
+          g_task_dur[5] = DUR_TX        * (1.0f + rng_jitter());
+
+          /* Rebuild graph with jittered durations */
+          static cs_graph_t  jg;
+          cs_graph_init(&jg);
+          cs_add_service(&jg, "recv",      NODE_NAME, g_task_dur[0]);
+          cs_add_service(&jg, "preproc_L", NODE_NAME, g_task_dur[1]);
+          cs_add_service(&jg, "preproc_R", NODE_NAME, g_task_dur[2]);
+          cs_add_service(&jg, "fuse",      NODE_NAME, g_task_dur[3]);
+          cs_add_service(&jg, "infer",     NODE_NAME, g_task_dur[4]);
+          cs_add_service(&jg, "tx",        NODE_NAME, g_task_dur[5]);
+          cs_add_edge(&jg, CS_WAKE_ID,  "recv",      0.0f);
+          cs_add_edge(&jg, "recv",      "preproc_L", IPC_DELTA);
+          cs_add_edge(&jg, "recv",      "preproc_R", IPC_DELTA);
+          cs_add_edge(&jg, "preproc_L", "fuse",      IPC_DELTA);
+          cs_add_edge(&jg, "preproc_R", "fuse",      IPC_DELTA);
+          cs_add_edge(&jg, "fuse",      "infer",     IPC_DELTA);
+          cs_add_edge(&jg, "infer",     "tx",        IPC_DELTA);
+          const char *terms[] = {"tx"};
+          cs_set_terminals(&jg, terms, 1);
+
+          static cs_schedule_t js, jy, jc;
+          cs_schedule_b_seq(&jg,     &js);
+          cs_schedule_b_systemd(&jg, &jy);
+          cs_schedule_c2(&jg,        &jc);
+
+          sum_seq += js.T;  if (js.T <= deadline) hit_seq++;
+          sum_sys += jy.T;  if (jy.T <= deadline) hit_sys++;
+          sum_c2  += jc.T;  if (jc.T <= deadline) hit_c2++;
+        }
+
+      /* Restore nominal durations */
+      g_task_dur[0] = DUR_RECV;
+      g_task_dur[1] = DUR_PREPROC_L;
+      g_task_dur[2] = DUR_PREPROC_R;
+      g_task_dur[3] = DUR_FUSE;
+      g_task_dur[4] = DUR_INFER;
+      g_task_dur[5] = DUR_TX;
+
+      printf("\n");
+      printf("╔══════════════════════════════════════════════════════════╗\n");
+      printf("║  STATISTICAL RESULTS  (%d runs, deadline = %.0f ms)     \n",
+             n_runs, deadline);
+      printf("╠══════════════════════════════════════════════════════════╣\n");
+      printf("║  Strategy    Avg T (ms)   Meet-rate   Target             ║\n");
+      printf("╠══════════════════════════════════════════════════════════╣\n");
+      printf("║  FIFO(B_seq) %8.1f ms   %5.1f%%      < 70%%             ║\n",
+             sum_seq / n_runs, 100.0f * hit_seq / n_runs);
+      printf("║  B_systemd   %8.1f ms   %5.1f%%      80-90%%            ║\n",
+             sum_sys / n_runs, 100.0f * hit_sys / n_runs);
+      printf("║  δ-C2        %8.1f ms   %5.1f%%      >= 95%%            ║\n",
+             sum_c2  / n_runs, 100.0f * hit_c2  / n_runs);
+      printf("╚══════════════════════════════════════════════════════════╝\n");
+      printf("  Speedup FIFO→δ: %.3f×\n",
+             (sum_seq / n_runs) / (sum_c2 / n_runs));
+      printf("\n");
+      return EXIT_SUCCESS;
+    }
+
+  /* Single-run: execute with real pthreads and measure wall time */
   printf("\n--- Executing B_seq ---\n");
   float wall_seq = execute_schedule(&sched_seq, &graph, dry);
+
+  printf("\n--- Executing B_systemd ---\n");
+  float wall_sys = execute_schedule(&sched_sys, &graph, dry);
 
   printf("\n--- Executing C2 ---\n");
   float wall_c2  = execute_schedule(&sched_c2, &graph, dry);
@@ -345,11 +470,12 @@ int main(int argc, FAR char *argv[])
   printf("╔══════════════════════════════════════════╗\n");
   printf("║  RESULTS                                  ║\n");
   printf("╠══════════════════════════════════════════╣\n");
-  printf("║  B_seq wall time : %6.1f ms              ║\n", wall_seq);
-  printf("║  C2    wall time : %6.1f ms              ║\n", wall_c2);
+  printf("║  B_seq     wall time : %6.1f ms          ║\n", wall_seq);
+  printf("║  B_systemd wall time : %6.1f ms          ║\n", wall_sys);
+  printf("║  C2 (δ)   wall time : %6.1f ms          ║\n", wall_c2);
   if (wall_c2 > 0.0f)
     {
-      printf("║  Measured speedup: %6.3f×               ║\n",
+      printf("║  Speedup (B_seq/C2): %6.3f×             ║\n",
              wall_seq / wall_c2);
     }
 

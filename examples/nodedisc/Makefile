@@ -14,4 +14,7 @@ endif
 
 MAINSRC = nodedisc_main.c nodelink_daemon_main.c
 
+CFLAGS  += -I$(APPDIR)/examples/inferd
+LDLIBS  += -lpthread
+
 include $(APPDIR)/Application.mk

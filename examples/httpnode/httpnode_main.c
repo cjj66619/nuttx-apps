@@ -187,7 +187,7 @@ static void handle_request(int conn)
     "<!DOCTYPE html><html><head>"
     "<meta charset='utf-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-    "<meta http-equiv='refresh' content='3'>"
+    "<meta http-equiv='refresh' content='1'>"
     "<title>openvela S3 Node</title>"
     "<style>"
     "*{box-sizing:border-box;margin:0;padding:0}"
@@ -232,7 +232,7 @@ static void handle_request(int conn)
     "<div class='r'><span>RAM free</span><span><b>%d / %d KB</b></span></div>"
     "<div class='b'><div class='f' style='width:%d%%;background:#f59e0b'></div></div></div>"
 
-    "<footer>auto-refresh 3s &bull; <a href='/'>reload</a></footer>"
+    "<footer>auto-refresh 1s &bull; <a href='/'>reload</a></footer>"
     "</body></html>",
 
     g_node_ip, up_h, up_m, up_s,

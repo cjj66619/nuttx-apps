@@ -25,8 +25,10 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <fcntl.h>
 
 #include "lednode.h"
+#include "infer_rpc.h"
 
 /* httpnode stats hook — weak so inferd works without httpnode running */
 extern void httpnode_record_infer(float result, int latency_us)
@@ -50,14 +52,74 @@ static int tflm_infer_once(float input, float *output)
  * Definitions
  ****************************************************************************/
 
-#define INFERD_PORT       4446
 #define DEFAULT_N         100
 #define BENCH_RUNS        50
 #define BATCH_SIZE        1000   /* repeat each call N times for stable timing */
 
 /****************************************************************************
+ * δ-C2 peer state  (extern declared in infer_rpc.h)
+ ****************************************************************************/
+
+dc2_peer_t   g_dc2_peers[DC2_MAX_PEERS];
+volatile int g_dc2_n_peers = 0;
+
+/****************************************************************************
  * Helpers
  ****************************************************************************/
+
+static float read_cpu_pct(void)
+{
+  float pct = 0.0f;
+#ifdef CONFIG_FS_PROCFS
+  int fd = open("/proc/cpuload", O_RDONLY);
+  if (fd >= 0)
+    {
+      char buf[32];
+      int n = read(fd, buf, sizeof(buf) - 1);
+      close(fd);
+      if (n > 0) { buf[n] = '\0'; pct = strtof(buf, NULL); }
+    }
+#endif
+  return pct;
+}
+
+dc2_decision_t dc2_decide(float local_cpu, const char **peer_ip_out)
+{
+  *peer_ip_out = NULL;
+  if (local_cpu < DC2_LOCAL_CPU_THRESH || g_dc2_n_peers == 0)
+    return DC2_LOCAL;
+
+  float best = 200.0f;
+  int   bidx = -1;
+  for (int i = 0; i < g_dc2_n_peers; i++)
+    {
+      if (g_dc2_peers[i].ip[0] == '\0') continue;
+      float c = g_dc2_peers[i].cpu_pct < 0 ? 50.0f : g_dc2_peers[i].cpu_pct;
+      if (c < best) { best = c; bidx = i; }
+    }
+
+  if (bidx < 0) return DC2_LOCAL;
+  *peer_ip_out = g_dc2_peers[bidx].ip;
+  return DC2_OFFLOAD;
+}
+
+void dc2_update_peer(const char *ip, float cpu_pct)
+{
+  for (int i = 0; i < g_dc2_n_peers; i++)
+    {
+      if (strncmp(g_dc2_peers[i].ip, ip, 15) == 0)
+        {
+          g_dc2_peers[i].cpu_pct = cpu_pct;
+          return;
+        }
+    }
+  if (g_dc2_n_peers < DC2_MAX_PEERS)
+    {
+      strncpy(g_dc2_peers[g_dc2_n_peers].ip, ip, 15);
+      g_dc2_peers[g_dc2_n_peers].cpu_pct = cpu_pct;
+      g_dc2_n_peers++;
+    }
+}
 
 static uint32_t now_us(void)
 {
@@ -73,8 +135,167 @@ static float synth_input(int i)
 }
 
 /****************************************************************************
+ * Persistent offload connection helpers
+ ****************************************************************************/
+
+static int  s_offload_fd = -1;
+static char s_offload_ip[16];
+
+static int ensure_offload_conn(const char *ip)
+{
+  if (s_offload_fd >= 0 && strncmp(s_offload_ip, ip, 15) == 0)
+    return s_offload_fd;
+
+  if (s_offload_fd >= 0) { close(s_offload_fd); s_offload_fd = -1; }
+
+  int conn = socket(AF_INET, SOCK_STREAM, 0);
+  if (conn < 0) return -1;
+
+  struct timeval tv;
+  tv.tv_sec  = DC2_OFFLOAD_TO_MS / 1000;
+  tv.tv_usec = (DC2_OFFLOAD_TO_MS % 1000) * 1000;
+  setsockopt(conn, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  setsockopt(conn, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+  struct sockaddr_in srv;
+  memset(&srv, 0, sizeof(srv));
+  srv.sin_family = AF_INET;
+  srv.sin_port   = htons(INFERD_PORT);
+  inet_pton(AF_INET, ip, &srv.sin_addr);
+
+  if (connect(conn, (struct sockaddr *)&srv, sizeof(srv)) < 0)
+    { close(conn); return -1; }
+
+  s_offload_fd = conn;
+  strncpy(s_offload_ip, ip, 15);
+  printf("[inferd] δ-C2: connected to offload peer %s:%d\n", ip, INFERD_PORT);
+  return conn;
+}
+
+static int do_offload(const char *ip, float input,
+                      float *output, uint32_t *lat_us_out)
+{
+  int conn = ensure_offload_conn(ip);
+  if (conn < 0) return 0;
+
+  uint32_t t0 = now_us();
+
+  if (send(conn, &input, sizeof(input), MSG_NOSIGNAL) != (int)sizeof(float))
+    goto fail;
+
+  uint8_t resp[8];
+  if (recv(conn, resp, 8, MSG_WAITALL) != 8)
+    goto fail;
+
+  *lat_us_out = now_us() - t0;
+  memcpy(output, resp, sizeof(float));
+  return 1;
+
+fail:
+  close(conn);
+  s_offload_fd = -1;
+  s_offload_ip[0] = '\0';
+  return 0;
+}
+
+/****************************************************************************
+ * Mode: daemon — δ-C2 adaptive inference loop
+ ****************************************************************************/
+
+static int mode_daemon(int n, int interval_ms)
+{
+  if (tflm_infer_init() < 0)
+    {
+      fprintf(stderr, "[inferd] tflm_infer_init failed\n");
+      return -1;
+    }
+
+  printf("[inferd] δ-C2 daemon  n=%s  interval=%dms  "
+         "offload_thresh=%.0f%%\n",
+         n == 0 ? "inf" : "", interval_ms,
+         (double)DC2_LOCAL_CPU_THRESH);
+  printf("[inferd] peers registered: %d\n\n", g_dc2_n_peers);
+
+  int      cnt_local    = 0;
+  int      cnt_offload  = 0;
+  int      cnt_fallback = 0;
+  uint32_t sum_local_us   = 0;
+  uint32_t sum_offload_us = 0;
+
+  for (int i = 0; n == 0 || i < n; i++)
+    {
+      float    input  = synth_input(i);
+      float    output = 0.0f;
+      uint32_t lat_us = 0;
+      const char *path_label;
+
+      float       local_cpu = read_cpu_pct();
+      const char *peer_ip   = NULL;
+      dc2_decision_t dec    = dc2_decide(local_cpu, &peer_ip);
+
+      if (dec == DC2_OFFLOAD && peer_ip != NULL)
+        {
+          if (do_offload(peer_ip, input, &output, &lat_us))
+            {
+              cnt_offload++;
+              sum_offload_us += lat_us;
+              path_label = "offload";
+              lednode_flash(LEDNODE_HB_TX);
+            }
+          else
+            {
+              uint32_t t0 = now_us();
+              tflm_infer_once(input, &output);
+              lat_us = now_us() - t0;
+              cnt_fallback++;
+              sum_local_us += lat_us;
+              path_label = "fallback";
+              lednode_flash(LEDNODE_INFER);
+            }
+        }
+      else
+        {
+          uint32_t t0 = now_us();
+          tflm_infer_once(input, &output);
+          lat_us = now_us() - t0;
+          cnt_local++;
+          sum_local_us += lat_us;
+          path_label = "local";
+          lednode_flash(LEDNODE_INFER);
+        }
+
+      if (httpnode_record_infer)
+        httpnode_record_infer(output, (int)lat_us);
+
+      printf("[inferd] #%-4d  cpu=%5.1f%%  %-8s  peer=%-15s  "
+             "in=%.4f  out=%.4f  %5u us\n",
+             i, (double)local_cpu, path_label,
+             peer_ip ? peer_ip : "-", (double)input,
+             (double)output, lat_us);
+
+      usleep(interval_ms * 1000);
+    }
+
+  int total_off = cnt_offload + cnt_fallback;
+  printf("\n[inferd] ── δ-C2 Daemon Summary ──────────────────\n");
+  printf("[inferd] local     : %d  (avg %.1f us)\n",
+         cnt_local,
+         cnt_local ? (double)sum_local_us / cnt_local : 0.0);
+  printf("[inferd] offload   : %d  (avg %.1f us)\n",
+         cnt_offload,
+         cnt_offload ? (double)sum_offload_us / cnt_offload : 0.0);
+  printf("[inferd] fallback  : %d\n", cnt_fallback);
+  if (total_off > 0)
+    printf("[inferd] offload success rate: %.1f%%\n",
+           100.0 * cnt_offload / total_off);
+  printf("[inferd] ──────────────────────────────────────────\n\n");
+  return 0;
+}
+
+/****************************************************************************
  * Mode: local — benchmark local inference
  ****************************************************************************/
+
 
 static int mode_local(int n)
 {
@@ -345,11 +566,13 @@ int main(int argc, FAR char *argv[])
   if (argc < 2)
     {
       printf("Usage:\n"
-             "  inferd local  [N]           local inference benchmark\n"
-             "  inferd demo   [interval_ms] continuous demo (default 1000ms)\n"
-             "  inferd stress [interval_ms] heavy FPU load (shows CPU in dashboard)\n"
-             "  inferd server               TCP worker (port %d)\n"
-             "  inferd bench  <ip> [N]      local vs offloaded comparison\n",
+             "  inferd local  [N]               local inference benchmark\n"
+             "  inferd demo   [interval_ms]     continuous demo (default 1000ms)\n"
+             "  inferd stress [interval_ms]     heavy FPU load (shows CPU in dashboard)\n"
+             "  inferd server                   TCP worker (port %d)\n"
+             "  inferd bench  <ip> [N]          local vs offloaded comparison\n"
+             "  inferd daemon [N [interval_ms]] delta-C2 adaptive daemon\n"
+             "    N=0 runs forever; interval default 500ms\n",
              INFERD_PORT);
       return EXIT_FAILURE;
     }
@@ -398,6 +621,13 @@ int main(int argc, FAR char *argv[])
         { printf("bench: peer IP required\n"); return EXIT_FAILURE; }
       int n = (argc >= 4) ? atoi(argv[3]) : BENCH_RUNS;
       return mode_bench(argv[2], n) == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+
+  else if (strcmp(argv[1], "daemon") == 0)
+    {
+      int n   = (argc >= 3) ? atoi(argv[2]) : 0;
+      int ms  = (argc >= 4) ? atoi(argv[3]) : 500;
+      return mode_daemon(n, ms) == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
 
   printf("[inferd] unknown mode: %s\n", argv[1]);
